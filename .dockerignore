@@ -2,4 +2,3 @@
 !/cmd
 !/internal
 !go.*
-!Makefile
