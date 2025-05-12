@@ -1,6 +1,7 @@
 # Kamal Proxy - A minimal HTTP proxy for zero-downtime deployments
 
-# What it is
+## What it is
+
 This is a fork with a few useful additions like:
 - Dockerfile for Alpine Linux;
 - Minimized executable;
