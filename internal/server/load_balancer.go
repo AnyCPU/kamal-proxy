@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,7 +13,11 @@ import (
 	"time"
 )
 
-const LoadBalancerWriteCookieName = "kamal-writer"
+const (
+	LoadBalancerAffinityOptOutHeader = "X-Writer-Affinity"
+	LoadBalancerTargetHeader         = "X-Kamal-Target"
+	LoadBalancerWriteCookieName      = "kamal-writer"
+)
 
 var ErrorNoHealthyTargets = errors.New("no healthy targets")
 
@@ -42,7 +48,7 @@ func NewTargetList(targetURLs, readerURLs []string, options TargetOptions) (Targ
 func (tl TargetList) Names() []string {
 	names := []string{}
 	for _, target := range tl {
-		names = append(names, target.Target())
+		names = append(names, target.Address())
 	}
 	return names
 }
@@ -172,9 +178,11 @@ func (lb *LoadBalancer) StartRequest(w http.ResponseWriter, r *http.Request) fun
 		return nil
 	}
 
-	if lb.hasReaders && !readRequest && !lb.skipsWriterAffinity(r) {
-		lb.setWriteCookie(w)
+	if lb.writerAffinityTimeout > 0 && lb.hasReaders && !readRequest {
+		w = newLoadBalancerReponseWriter(w, lb.writerAffinityTimeout)
 	}
+
+	lb.setTargetHeader(req, target)
 
 	return func() {
 		target.SendRequest(w, req)
@@ -224,10 +232,6 @@ func (lb *LoadBalancer) isReadRequest(req *http.Request) bool {
 		(lb.readTargetsAcceptWebsockets || !lb.isWebSocketRequest(req))
 }
 
-func (lb *LoadBalancer) skipsWriterAffinity(req *http.Request) bool {
-	return req.Header.Get("X-Writer-Affinity") == "false"
-}
-
 func (lb *LoadBalancer) isWebSocketRequest(req *http.Request) bool {
 	return req.Method == http.MethodGet &&
 		strings.EqualFold(req.Header.Get("Upgrade"), "websocket") &&
@@ -267,20 +271,17 @@ func (lb *LoadBalancer) updateHealthyTargets() {
 	}
 }
 
-func (lb *LoadBalancer) setWriteCookie(w http.ResponseWriter) {
-	if lb.writerAffinityTimeout > 0 {
-		expires := time.Now().Add(lb.writerAffinityTimeout)
+func (lb *LoadBalancer) setTargetHeader(req *http.Request, target *Target) {
+	address := target.Address()
 
-		cookie := &http.Cookie{
-			Name:     LoadBalancerWriteCookieName,
-			Value:    strconv.FormatInt(expires.UnixMilli(), 10),
-			Path:     "/",
-			HttpOnly: true,
-			Expires:  expires.Add(time.Second),
+	if target.options.ForwardHeaders {
+		prior := req.Header[LoadBalancerTargetHeader]
+		if len(prior) > 0 {
+			address = strings.Join(prior, ", ") + ", " + address
 		}
-
-		http.SetCookie(w, cookie)
 	}
+
+	req.Header.Set(LoadBalancerTargetHeader, address)
 }
 
 func (lb *LoadBalancer) hasWriteCookie(r *http.Request) bool {
@@ -295,4 +296,67 @@ func (lb *LoadBalancer) hasWriteCookie(r *http.Request) bool {
 	}
 
 	return time.Now().UnixMilli() < expires
+}
+
+type loadBalancerResponseWriter struct {
+	http.ResponseWriter
+	headerWritten         bool
+	writerAffinityTimeout time.Duration
+}
+
+func newLoadBalancerReponseWriter(w http.ResponseWriter, writerAffinityTimeout time.Duration) *loadBalancerResponseWriter {
+	return &loadBalancerResponseWriter{
+		ResponseWriter:        w,
+		headerWritten:         false,
+		writerAffinityTimeout: writerAffinityTimeout,
+	}
+}
+
+func (w *loadBalancerResponseWriter) WriteHeader(statusCode int) {
+	w.setWriterAffinityCookie()
+
+	w.ResponseWriter.WriteHeader(statusCode)
+	w.headerWritten = true
+}
+
+func (w *loadBalancerResponseWriter) Write(b []byte) (int, error) {
+	if !w.headerWritten {
+		w.WriteHeader(http.StatusOK)
+	}
+
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *loadBalancerResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("ResponseWriter does not implement http.Hijacker")
+	}
+
+	return hijacker.Hijack()
+}
+
+func (w *loadBalancerResponseWriter) Flush() {
+	flusher, ok := w.ResponseWriter.(http.Flusher)
+	if ok {
+		flusher.Flush()
+	}
+}
+
+func (w *loadBalancerResponseWriter) setWriterAffinityCookie() {
+	if w.Header().Get(LoadBalancerAffinityOptOutHeader) != "false" {
+		expires := time.Now().Add(w.writerAffinityTimeout)
+
+		cookie := &http.Cookie{
+			Name:     LoadBalancerWriteCookieName,
+			Value:    strconv.FormatInt(expires.UnixMilli(), 10),
+			Path:     "/",
+			HttpOnly: true,
+			Expires:  expires.Add(time.Second),
+		}
+
+		http.SetCookie(w, cookie)
+	}
+
+	w.Header().Del(LoadBalancerAffinityOptOutHeader)
 }

@@ -78,9 +78,12 @@ func TestLoadBalancer_StartRequest(t *testing.T) {
 }
 
 func TestLoadBalancer_Readers(t *testing.T) {
-	createLoadBalancer := func(includeReader bool, writerAffinityTimeout time.Duration, readTargetsAcceptWebsockets bool) *LoadBalancer {
+	createLoadBalancer := func(includeReader bool, writerAffinityTimeout time.Duration, readTargetsAcceptWebsockets bool, handler http.HandlerFunc) *LoadBalancer {
 		writer := testTarget(t, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("X-Writer", "true")
+			if handler != nil {
+				handler(w, r)
+			}
 		})
 
 		readers := []string{}
@@ -88,10 +91,10 @@ func TestLoadBalancer_Readers(t *testing.T) {
 			reader := testReadOnlyTarget(t, func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("X-Writer", "false")
 			})
-			readers = []string{reader.Target()}
+			readers = []string{reader.Address()}
 		}
 
-		tl, err := NewTargetList([]string{writer.Target()}, readers, defaultTargetOptions)
+		tl, err := NewTargetList([]string{writer.Address()}, readers, defaultTargetOptions)
 		require.NoError(t, err)
 
 		lb := NewLoadBalancer(tl, writerAffinityTimeout, readTargetsAcceptWebsockets)
@@ -103,7 +106,7 @@ func TestLoadBalancer_Readers(t *testing.T) {
 	}
 
 	createDefaultLoadBalancer := func(includeReader bool) *LoadBalancer {
-		return createLoadBalancer(includeReader, DefaultWriterAffinityTimeout, false)
+		return createLoadBalancer(includeReader, DefaultWriterAffinityTimeout, false, nil)
 	}
 
 	checkResponse := func(lb *LoadBalancer, r *http.Request, writer bool) *httptest.ResponseRecorder {
@@ -157,12 +160,12 @@ func TestLoadBalancer_Readers(t *testing.T) {
 		req.Header.Set("Connection", "Upgrade")
 		req.Header.Set("Upgrade", "websocket")
 
-		lb := createLoadBalancer(true, DefaultWriterAffinityTimeout, true)
+		lb := createLoadBalancer(true, DefaultWriterAffinityTimeout, true, nil)
 		_ = checkResponse(lb, req, isReader)
 	})
 
 	t.Run("writer affinity sub 1s", func(t *testing.T) {
-		lb := createLoadBalancer(true, time.Millisecond*200, false)
+		lb := createLoadBalancer(true, time.Millisecond*200, false, nil)
 
 		w := checkResponse(lb, httptest.NewRequest("PUT", "/something", nil), isWriter)
 		cookie := w.Result().Cookies()[0]
@@ -193,21 +196,59 @@ func TestLoadBalancer_Readers(t *testing.T) {
 	})
 
 	t.Run("writer affinity not active when the timeout is zero", func(t *testing.T) {
-		lb := createLoadBalancer(true, 0, false)
+		lb := createLoadBalancer(true, 0, false, nil)
 
 		w := checkResponse(lb, httptest.NewRequest("PUT", "/something", nil), isWriter)
 		assert.Empty(t, w.Result().Cookies())
 	})
 
-	t.Run("writer affinity not active when `X-Writer-Affinity` header is `false`", func(t *testing.T) {
-		lb := createDefaultLoadBalancer(true)
+	t.Run("writer affinity not active when `X-Writer-Affinity` response header is `false`", func(t *testing.T) {
+		lb := createLoadBalancer(true, DefaultWriterAffinityTimeout, false, func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Set("X-Writer-Affinity", "false")
+		})
 
 		req := httptest.NewRequest("PUT", "/something", nil)
-		req.Header.Set("X-Writer-Affinity", "false")
 
 		w := checkResponse(lb, req, isWriter)
 		assert.Empty(t, w.Result().Cookies())
+		assert.Empty(t, w.Header().Get("X-Writer-Affinity"))
 	})
+}
+
+func TestLoadBalancer_TargetHeader(t *testing.T) {
+	reader := testReadOnlyTarget(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(LoadBalancerTargetHeader, r.Header.Get(LoadBalancerTargetHeader))
+	})
+
+	writer := testTarget(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(LoadBalancerTargetHeader, r.Header.Get(LoadBalancerTargetHeader))
+	})
+
+	tl, _ := NewTargetList([]string{writer.Address()}, []string{reader.Address()}, defaultTargetOptions)
+	lb := NewLoadBalancer(tl, DefaultWriterAffinityTimeout, false)
+	lb.WaitUntilHealthy(time.Second)
+
+	checkHeader := func(method string, expected string, priorHeader ...string) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(method, "/", nil)
+		if len(priorHeader) > 0 {
+			req.Header.Set(LoadBalancerTargetHeader, priorHeader[0])
+		}
+
+		lb.StartRequest(w, req)()
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, expected, w.Header().Get(LoadBalancerTargetHeader))
+	}
+
+	checkHeader("GET", reader.Address())
+	checkHeader("POST", writer.Address())
+	checkHeader("POST", writer.Address(), "existing")
+
+	for _, t := range tl {
+		t.options.ForwardHeaders = true
+	}
+	checkHeader("POST", "existing, "+writer.Address(), "existing")
 }
 
 // Helpers
@@ -215,7 +256,7 @@ func TestLoadBalancer_Readers(t *testing.T) {
 func testLoadBalancerWithHandlers(t *testing.T, handlers ...http.HandlerFunc) *LoadBalancer {
 	targets := []string{}
 	for _, h := range handlers {
-		targets = append(targets, testTarget(t, h).Target())
+		targets = append(targets, testTarget(t, h).Address())
 	}
 
 	tl, err := NewTargetList(targets, []string{}, defaultTargetOptions)
