@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.24.3-alpine3.21 AS build
+FROM --platform=$BUILDPLATFORM golang:1.24.3-alpine3.22 AS build
 ARG TARGETOS
 ARG TARGETARCH
 RUN apk --no-cache upgrade
@@ -10,7 +10,7 @@ COPY . .
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o bin/ ./cmd/...
 
 
-FROM alpine:3.21 AS app
+FROM alpine:3.22 AS app
 RUN apk --no-cache upgrade
 RUN apk --no-cache add tzdata ca-certificates
 COPY --from=build /app/bin/kamal-proxy /usr/local/bin/
