@@ -1,6 +1,6 @@
 module github.com/basecamp/kamal-proxy
 
-go 1.24.4
+go 1.24.5
 
 require (
 	github.com/coder/websocket v1.8.13
