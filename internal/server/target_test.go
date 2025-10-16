@@ -61,8 +61,8 @@ func TestTarget_ServeSSE(t *testing.T) {
 			require.NoError(t, err)
 			target.SendRequest(w, r)
 		}))
-		defer server.Close()
-		defer close(finishedReading)
+		t.Cleanup(server.Close)
+		t.Cleanup(func() { close(finishedReading) })
 
 		resp, err := http.Get(server.URL)
 		require.NoError(t, err)
@@ -103,14 +103,14 @@ func TestTarget_ServeWebSocket(t *testing.T) {
 			c, err := websocket.Accept(w, r, &websocket.AcceptOptions{})
 			require.NoError(t, err)
 
-			go func() {
-				kind, body, err := c.Read(context.Background())
+			go func(t *testing.T) {
+				kind, body, err := c.Read(t.Context())
 				require.NoError(t, err)
 				assert.Equal(t, websocket.MessageText, kind)
 
-				c.Write(context.Background(), websocket.MessageText, body)
+				c.Write(t.Context(), websocket.MessageText, body)
 				defer c.CloseNow()
-			}()
+			}(t)
 		})
 
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -118,17 +118,17 @@ func TestTarget_ServeWebSocket(t *testing.T) {
 			require.NoError(t, err)
 			target.SendRequest(w, r)
 		}))
-		defer server.Close()
+		t.Cleanup(server.Close)
 
 		websocketURL := strings.Replace(server.URL, "http:", "ws:", 1)
 
-		c, _, err := websocket.Dial(context.Background(), websocketURL, nil)
+		c, _, err := websocket.Dial(t.Context(), websocketURL, nil)
 		require.NoError(t, err)
-		defer c.CloseNow()
+		t.Cleanup(func() { _ = c.CloseNow() })
 
-		c.Write(context.Background(), websocket.MessageText, []byte(body))
+		c.Write(t.Context(), websocket.MessageText, []byte(body))
 
-		return c.Read(context.Background())
+		return c.Read(t.Context())
 	}
 
 	t.Run("without buffering", func(t *testing.T) {
@@ -147,12 +147,13 @@ func TestTarget_ServeWebSocket(t *testing.T) {
 }
 
 func TestTarget_CancelledRequestsHaveStatus499(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
 
 	target := testTarget(t, func(w http.ResponseWriter, r *http.Request) {
 		cancel()
+		<-r.Context().Done()
 	})
 
 	testServeRequestWithTarget(t, target, w, req)
@@ -373,7 +374,7 @@ func TestTarget_DrainHijackedConnectionsImmediately(t *testing.T) {
 		require.NoError(t, err)
 		defer c.CloseNow()
 
-		_, _, err = c.Read(context.Background())
+		_, _, err = c.Read(t.Context())
 		require.Error(t, err)
 	})
 
@@ -382,13 +383,13 @@ func TestTarget_DrainHijackedConnectionsImmediately(t *testing.T) {
 		require.NoError(t, err)
 		target.SendRequest(w, r)
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
 
 	websocketURL := strings.Replace(server.URL, "http:", "ws:", 1)
 
-	c, _, err := websocket.Dial(context.Background(), websocketURL, nil)
+	c, _, err := websocket.Dial(t.Context(), websocketURL, nil)
 	require.NoError(t, err)
-	defer c.CloseNow()
+	t.Cleanup(func() { _ = c.CloseNow() })
 
 	startedDraining := time.Now()
 	target.Drain(time.Second * 5)
@@ -538,6 +539,66 @@ func TestTarget_EnforceMaxBodySizes(t *testing.T) {
 			require.Equal(t, http.StatusInternalServerError, w.Result().StatusCode)
 		})
 	})
+}
+
+func TestTarget_buildHealthCheckURL(t *testing.T) {
+	tests := []struct {
+		name            string
+		targetURL       string
+		healthCheckPort int
+		healthCheckPath string
+		expectedURL     string
+	}{
+		{
+			name:            "default port - same as target",
+			targetURL:       "localhost:3000",
+			healthCheckPort: 0,
+			healthCheckPath: "/up",
+			expectedURL:     "http://localhost:3000/up",
+		},
+		{
+			name:            "custom health check port",
+			targetURL:       "localhost:3000",
+			healthCheckPort: 8080,
+			healthCheckPath: "/health",
+			expectedURL:     "http://localhost:8080/health",
+		},
+		{
+			name:            "target without port, custom health check port",
+			targetURL:       "localhost",
+			healthCheckPort: 9090,
+			healthCheckPath: "/status",
+			expectedURL:     "http://localhost:9090/status",
+		},
+		{
+			name:            "target without port, default health check",
+			targetURL:       "localhost",
+			healthCheckPort: 0,
+			healthCheckPath: "/up",
+			expectedURL:     "http://localhost/up",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			options := TargetOptions{
+				HealthCheckConfig: HealthCheckConfig{
+					Path: tt.healthCheckPath,
+					Port: tt.healthCheckPort,
+				},
+			}
+
+			target, err := NewTarget(tt.targetURL, options)
+			if err != nil {
+				t.Fatalf("Failed to create target: %v", err)
+			}
+
+			healthCheckURL := target.buildHealthCheckURL()
+			if healthCheckURL.String() != tt.expectedURL {
+				t.Errorf("buildHealthCheckURL() = %v, want %v", healthCheckURL.String(), tt.expectedURL)
+			}
+		})
+	}
 }
 
 // Helpers
