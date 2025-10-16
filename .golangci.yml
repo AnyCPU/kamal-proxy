@@ -3,3 +3,9 @@ version: "2"
 linters:
   disable:
     - errcheck
+
+output:
+  show-stats: true
+  sort-order:
+    - file
+    - linter
