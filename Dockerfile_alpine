@@ -1,18 +1,15 @@
 FROM --platform=$BUILDPLATFORM golang:1.25.5-alpine3.23 AS build
 ARG TARGETOS
 ARG TARGETARCH
-RUN apk --no-cache upgrade
-RUN apk --no-cache add tzdata ca-certificates
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN GOEXPERIMENT=greenteagc,jsonv2 GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o bin/ ./cmd/...
 
-
 FROM alpine:3.23 AS app
-RUN apk --no-cache upgrade
-RUN apk --no-cache add tzdata ca-certificates
+RUN apk --no-cache upgrade && \
+    apk --no-cache add tzdata ca-certificates
 COPY --from=build /app/bin/kamal-proxy /usr/local/bin/
 EXPOSE 80 443
 RUN adduser -D kamal-proxy \
