@@ -109,7 +109,7 @@ func (w *bufferedResponseWriter) Write(data []byte) (int, error) {
 	}
 
 	n, err := w.buffer.Write(data)
-	if err == ErrMaximumSizeExceeded {
+	if errors.Is(err, ErrMaximumSizeExceeded) {
 		// Returning an error here will cause the ReverseProxy to panic. If the
 		// error is that we're exceeding the limit, just pretend it was all
 		// fine. We'll handle the overflow condition when we send the buffer to
