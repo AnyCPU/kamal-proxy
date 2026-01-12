@@ -382,6 +382,12 @@ func (t *Target) handleProxyError(w http.ResponseWriter, r *http.Request, err er
 		return
 	}
 
+	if isChunkedEncodingError(err) {
+		slog.Info("Malformed request", "target", t.Address(), "path", r.URL.Path, "error", err)
+		SetErrorResponse(w, r, http.StatusBadRequest, nil)
+		return
+	}
+
 	slog.Error("Error while proxying", "target", t.Address(), "path", r.URL.Path, "error", err)
 	SetErrorResponse(w, r, http.StatusBadGateway, nil)
 }
