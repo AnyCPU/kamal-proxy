@@ -516,18 +516,18 @@ func (w *targetResponseWriter) Write(b []byte) (int, error) {
 	return w.ResponseWriter.Write(b)
 }
 
-func (r *targetResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	hijacker, ok := r.ResponseWriter.(http.Hijacker)
+func (w *targetResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := w.ResponseWriter.(http.Hijacker)
 	if !ok {
 		return nil, nil, errors.New("ResponseWriter does not implement http.Hijacker")
 	}
 
-	r.inflightRequest.hijacked = true
+	w.inflightRequest.hijacked = true
 	return hijacker.Hijack()
 }
 
-func (r *targetResponseWriter) Flush() {
-	flusher, ok := r.ResponseWriter.(http.Flusher)
+func (w *targetResponseWriter) Flush() {
+	flusher, ok := w.ResponseWriter.(http.Flusher)
 	if ok {
 		flusher.Flush()
 	}
