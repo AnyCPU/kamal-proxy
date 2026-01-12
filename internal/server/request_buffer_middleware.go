@@ -24,13 +24,13 @@ func (h *RequestBufferMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Reque
 	requestBuffer, err := NewBufferedReadCloser(r.Body, h.maxBytes, h.maxMemBytes)
 	if err != nil {
 		if errors.Is(err, ErrMaximumSizeExceeded) {
-			http.Error(w, "Request too large", http.StatusRequestEntityTooLarge)
+			SetErrorResponse(w, r, http.StatusRequestEntityTooLarge, nil)
 		} else if isChunkedEncodingError(err) {
 			slog.Info("Malformed chunked request", "path", r.URL.Path, "error", err)
-			http.Error(w, "Bad Request", http.StatusBadRequest)
+			SetErrorResponse(w, r, http.StatusBadRequest, nil)
 		} else {
 			slog.Error("Error buffering request", "path", r.URL.Path, "error", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			SetErrorResponse(w, r, http.StatusInternalServerError, nil)
 		}
 		return
 	}
