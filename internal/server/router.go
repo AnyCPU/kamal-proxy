@@ -341,7 +341,7 @@ func (r *Router) installLoadBalancer(name string, slot TargetSlot, lb *LoadBalan
 	return replaced, err
 }
 
-func (r *Router) saveStateSnapshot() error {
+func (r *Router) saveStateSnapshot() (err error) {
 	services := []*Service{}
 	r.withReadLock(func() error {
 		for _, service := range r.services.All() {
@@ -352,8 +352,15 @@ func (r *Router) saveStateSnapshot() error {
 
 	f, err := os.Create(r.statePath)
 	if err != nil {
+		slog.Error("Unable to create state file", "error", err, "path", r.statePath)
 		return err
 	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			slog.Error("Unable to close state file", "error", cerr, "path", r.statePath)
+			err = errors.Join(err, cerr)
+		}
+	}()
 
 	err = json.NewEncoder(f).Encode(services)
 	if err != nil {
