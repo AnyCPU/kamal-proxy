@@ -683,6 +683,19 @@ func TestRouter_WildcardDomainsCannotBeUsedWithAutomaticTLS(t *testing.T) {
 	require.Equal(t, ErrorAutomaticTLSDoesNotSupportWildcards, err)
 }
 
+func TestRouter_WildcardDomainsAllowedWithTLSWildcardSubdomainsFlag(t *testing.T) {
+	router := testRouter(t)
+	_, first := testBackend(t, "first", http.StatusOK)
+
+	serviceOptions := defaultServiceOptions
+	serviceOptions.Hosts = []string{"first.example.com", "*.first.example.com"}
+	serviceOptions.TLSEnabled = true
+	serviceOptions.TLSWildcardSubdomains = true
+
+	err := router.DeployService("first", []string{first}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions)
+	require.NoError(t, err)
+}
+
 func TestRouter_ServiceFailingToBecomeHealthy(t *testing.T) {
 	router := testRouter(t)
 	_, target := testBackend(t, "", http.StatusInternalServerError)
