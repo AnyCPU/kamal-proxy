@@ -1,10 +1,12 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -81,6 +83,7 @@ type ServiceOptions struct {
 	Hosts                       []string      `json:"hosts"`
 	PathPrefixes                []string      `json:"path_prefixes"`
 	TLSEnabled                  bool          `json:"tls_enabled"`
+	TLSWildcardSubdomains       bool          `json:"tls_wildcard_subdomains"`
 	TLSCertificatePath          string        `json:"tls_certificate_path"`
 	TLSPrivateKeyPath           string        `json:"tls_private_key_path"`
 	TLSRedirect                 bool          `json:"tls_redirect"`
@@ -386,18 +389,49 @@ func (s *Service) createCertManager(options ServiceOptions) (CertManager, error)
 
 	// Ensure we're not trying to use Let's Encrypt to fetch a wildcard domain,
 	// as that is not supported with the challenge types that we use.
-	for _, host := range options.Hosts {
-		if strings.Contains(host, "*") {
-			return nil, ErrorAutomaticTLSDoesNotSupportWildcards
+	// Unless the caller has opted in to per-subdomain on-demand cert issuance.
+	if !options.TLSWildcardSubdomains {
+		for _, host := range options.Hosts {
+			if strings.Contains(host, "*") {
+				return nil, ErrorAutomaticTLSDoesNotSupportWildcards
+			}
 		}
+	}
+
+	var hp autocert.HostPolicy
+	if options.TLSWildcardSubdomains {
+		hp = hostPolicy(options.Hosts)
+	} else {
+		hp = autocert.HostWhitelist(options.Hosts...)
 	}
 
 	return &autocert.Manager{
 		Prompt:     autocert.AcceptTOS,
 		Cache:      autocert.DirCache(options.ScopedCachePath()),
-		HostPolicy: autocert.HostWhitelist(options.Hosts...),
+		HostPolicy: hp,
 		Client:     &acme.Client{DirectoryURL: options.ACMEDirectory},
 	}, nil
+}
+
+// hostPolicy returns an autocert.HostPolicy that allows exact host matches and
+// single-level wildcard matches (e.g. "*.example.org" matches "foo.example.org"
+// but not "a.b.example.org"), consistent with the router's bindingsForHost logic.
+func hostPolicy(hosts []string) autocert.HostPolicy {
+	allowed := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		allowed[h] = true
+	}
+	return func(_ context.Context, host string) error {
+		if allowed[host] {
+			return nil
+		}
+		if sep := strings.Index(host, "."); sep > 0 {
+			if allowed["*"+host[sep:]] {
+				return nil
+			}
+		}
+		return fmt.Errorf("host %q not allowed by policy", host)
+	}
 }
 
 func (s *Service) createMiddleware(options ServiceOptions, certManager CertManager) (http.Handler, error) {
