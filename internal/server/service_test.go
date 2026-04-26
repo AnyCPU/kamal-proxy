@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -214,6 +215,25 @@ func TestService_UnmarshallingStateFromLegacyFormat(t *testing.T) {
 	assert.Equal(t, []string{"app.example.com"}, service.options.Hosts)
 	assert.Equal(t, []string{"/"}, service.options.PathPrefixes)
 	assert.Equal(t, 3*time.Second, service.targetOptions.ResponseTimeout)
+}
+
+func TestHostPolicy(t *testing.T) {
+	ctx := context.Background()
+
+	policy := hostPolicy([]string{"example.com", "*.example.org"})
+
+	// Exact match
+	assert.NoError(t, policy(ctx, "example.com"))
+
+	// Single-level wildcard match
+	assert.NoError(t, policy(ctx, "foo.example.org"))
+	assert.NoError(t, policy(ctx, "bar.example.org"))
+
+	// Multi-level subdomain does NOT match wildcard
+	assert.Error(t, policy(ctx, "a.b.example.org"))
+
+	// Unknown host
+	assert.Error(t, policy(ctx, "example.net"))
 }
 
 func testCreateService(t *testing.T, options ServiceOptions, targetOptions TargetOptions) *Service {
