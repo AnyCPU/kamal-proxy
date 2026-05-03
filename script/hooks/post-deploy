@@ -1,0 +1,69 @@
+#! /usr/bin/env bash
+# Post-deploy hook for the web role. Re-runs `kamal-proxy deploy` with
+# --tls-wildcard-subdomains so every subdomain of $PRIMARY_HOST gets its own
+# Let's Encrypt cert on first request. kamal-proxy persists this in its
+# state file, so the setting survives proxy restarts.
+set -euo pipefail
+
+PRIMARY_HOST="${PRIMARY_HOST:?PRIMARY_HOST must be set (e.g. example.com)}"
+SERVICE="${KAMAL_SERVICE:?KAMAL_SERVICE not set — is this running as a Kamal hook?}"
+ROLE="${KAMAL_ROLE:-web}"
+PROXY_NETWORK="${PROXY_NETWORK:-kamal}"
+TARGET_PORT="${TARGET_PORT:-80}"
+HEALTH_PATH="${HEALTH_PATH:-}"
+
+IFS=',' read -ra HOSTS <<< "${KAMAL_HOSTS:?KAMAL_HOSTS not set — is this running as a Kamal hook?}"
+
+# Each kamal-proxy instance keeps its own state file, so update every host.
+for host in "${HOSTS[@]}"; do
+  echo "==> [${host}] applying --tls-wildcard-subdomains..."
+  # printf %q shell-escapes each value so the remote re-parse is safe even
+  # if a value contains spaces or metacharacters.
+  ssh "root@${host}" "$(printf 'env SERVICE=%q ROLE=%q PROXY_NETWORK=%q PRIMARY_HOST=%q TARGET_PORT=%q HEALTH_PATH=%q bash -s' \
+    "$SERVICE" "$ROLE" "$PROXY_NETWORK" "$PRIMARY_HOST" "$TARGET_PORT" "$HEALTH_PATH")" <<'ENDSSH'
+  set -euo pipefail
+
+  if [[ "$(docker inspect -f '{{.State.Running}}' kamal-proxy 2>/dev/null)" != "true" ]]; then
+    echo "  kamal-proxy container not running on this host, skipping" >&2
+    exit 0
+  fi
+
+  # Match by Kamal's container labels — immune to name-prefix collisions and
+  # rolling-deploy races.
+  CONTAINERS=$(docker ps \
+    --filter "label=service=${SERVICE}" \
+    --filter "label=role=${ROLE}" \
+    --format '{{.CreatedAt}}|{{.ID}}')
+
+  if [[ -z "$CONTAINERS" ]]; then
+    echo "  service ${SERVICE}/${ROLE} not on this host, skipping" >&2
+    exit 0
+  fi
+
+  mapfile -t IDS < <(sort -r <<<"$CONTAINERS" | cut -d'|' -f2)
+  if [[ ${#IDS[@]} -gt 1 ]]; then
+    echo "  warning: ${#IDS[@]} ${SERVICE}/${ROLE} containers running, using newest" >&2
+  fi
+  CONTAINER="${IDS[0]}"
+
+  TARGET_IP=$(docker inspect "$CONTAINER" \
+    --format "{{with index .NetworkSettings.Networks \"${PROXY_NETWORK}\"}}{{.IPAddress}}{{end}}")
+  if [[ -z "$TARGET_IP" ]]; then
+    echo "ERROR: container ${CONTAINER} not attached to network ${PROXY_NETWORK}" >&2
+    exit 1
+  fi
+
+  HEALTH_ARGS=()
+  [[ -n "$HEALTH_PATH" ]] && HEALTH_ARGS+=(--health-check-path "$HEALTH_PATH")
+
+  docker exec kamal-proxy kamal-proxy deploy "${SERVICE}-${ROLE}" \
+    --host "${PRIMARY_HOST}" \
+    --host "*.${PRIMARY_HOST}" \
+    --tls \
+    --tls-wildcard-subdomains \
+    "${HEALTH_ARGS[@]}" \
+    --target "${TARGET_IP}:${TARGET_PORT}"
+ENDSSH
+done
+
+echo "==> Wildcard TLS enabled for *.${PRIMARY_HOST}"
