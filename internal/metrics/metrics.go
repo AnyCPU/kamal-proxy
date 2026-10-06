@@ -10,7 +10,7 @@ import (
 )
 
 type tracker interface {
-	TrackRequest(service, method string, status int, duration time.Duration)
+	TrackRequest(service, method string, status int, rollout bool, duration time.Duration)
 	AddInflightRequest(service string)
 	SubtractInflightRequest(service string)
 }
@@ -24,9 +24,11 @@ func Enable() http.Handler {
 
 type nullTracker struct{}
 
-func (nullTracker) TrackRequest(service, method string, status int, dur time.Duration) {}
-func (nullTracker) AddInflightRequest(service string)                                  {}
-func (nullTracker) SubtractInflightRequest(service string)                             {}
+func (nullTracker) TrackRequest(
+	service, method string, status int, rollout bool, dur time.Duration) {
+}
+func (nullTracker) AddInflightRequest(service string)      {}
+func (nullTracker) SubtractInflightRequest(service string) {}
 
 type prometheusTracker struct {
 	httpRequests     *prometheus.CounterVec
@@ -41,9 +43,9 @@ func NewPrometheusTracker() *prometheusTracker {
 				Name:      "http_requests_total",
 				Namespace: "kamal",
 				Subsystem: "proxy",
-				Help:      "HTTP requests processed, labeled by service, status code and method.",
+				Help:      "HTTP requests processed, labeled by service, status code, method and rollout status.",
 			},
-			[]string{"service", "method", "status"},
+			[]string{"service", "method", "status", "rollout"},
 		),
 
 		httpDuration: prometheus.NewHistogramVec(
@@ -51,10 +53,10 @@ func NewPrometheusTracker() *prometheusTracker {
 				Name:      "http_request_duration_seconds",
 				Namespace: "kamal",
 				Subsystem: "proxy",
-				Help:      "Duration of HTTP requests, labeled by service, status code and method.",
+				Help:      "Duration of HTTP requests, labeled by service, status code, method and rollout status.",
 				Buckets:   prometheus.DefBuckets,
 			},
-			[]string{"service", "method", "status"},
+			[]string{"service", "method", "status", "rollout"},
 		),
 
 		inflightRequests: prometheus.NewGaugeVec(
@@ -73,12 +75,13 @@ func NewPrometheusTracker() *prometheusTracker {
 	return tracker
 }
 
-func (p *prometheusTracker) TrackRequest(service, method string, status int, duration time.Duration) {
+func (p *prometheusTracker) TrackRequest(service, method string, status int, rollout bool, duration time.Duration) {
 	method = normalizeMethod(method)
 	statusString := strconv.Itoa(status)
+	rolloutString := strconv.FormatBool(rollout)
 
-	p.httpRequests.WithLabelValues(service, method, statusString).Inc()
-	p.httpDuration.WithLabelValues(service, method, statusString).Observe(duration.Seconds())
+	p.httpRequests.WithLabelValues(service, method, statusString, rolloutString).Inc()
+	p.httpDuration.WithLabelValues(service, method, statusString, rolloutString).Observe(duration.Seconds())
 }
 
 func (p *prometheusTracker) AddInflightRequest(service string) {

@@ -4,6 +4,7 @@ import (
 	"iter"
 	"net"
 	"net/http"
+	"path"
 	"slices"
 	"strings"
 )
@@ -92,7 +93,19 @@ func (m *ServiceMap) ServiceForRequest(req *http.Request) (*Service, string) {
 		}
 	}
 
-	return m.serviceFor(host, req.URL.Path)
+	return m.serviceFor(host, CleanRequestPath(req.URL.Path))
+}
+
+func CleanRequestPath(requestPath string) string {
+	if !strings.HasPrefix(requestPath, "/") {
+		return requestPath
+	}
+
+	cleaned := path.Clean(requestPath)
+	if strings.HasSuffix(requestPath, "/") && cleaned != rootPath {
+		cleaned += "/"
+	}
+	return cleaned
 }
 
 // Private
@@ -155,7 +168,7 @@ func (m *ServiceMap) updateRequestServiceMap() {
 
 func (m *ServiceMap) updateDefaultTLSHostname() {
 	for _, service := range m.services {
-		if service.options.TLSEnabled && len(service.options.Hosts) > 0 {
+		if service.options.TLSEnabled && len(service.options.Hosts) > 0 && service.options.Hosts[0] != "" {
 			m.defaultTLSHostname = service.options.Hosts[0]
 			return
 		}

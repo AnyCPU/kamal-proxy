@@ -1,4 +1,4 @@
-FROM golang:1.26.1 AS build
+FROM golang:1.27.1 AS build
 
 WORKDIR /app
 
@@ -6,7 +6,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN make
+ARG VERSION=dev
+RUN make build VERSION=$VERSION
 
 FROM ubuntu:noble-20251013 AS base
 

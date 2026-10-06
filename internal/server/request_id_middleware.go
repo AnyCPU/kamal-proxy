@@ -2,8 +2,7 @@ package server
 
 import (
 	"net/http"
-
-	"github.com/google/uuid"
+	"uuid"
 )
 
 const (

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,17 @@ func RoutingContext(r *http.Request) *routingContext {
 	return rc
 }
 
+func RoutedTargetPath(r *http.Request) string {
+	path := r.URL.Path
+	if rc := RoutingContext(r); rc != nil {
+		path = strings.TrimPrefix(CleanRequestPath(path), rc.MatchedPrefix)
+		if path == "" {
+			path = rootPath
+		}
+	}
+	return path
+}
+
 type Router struct {
 	statePath   string
 	services    *ServiceMap
@@ -42,14 +54,45 @@ type Router struct {
 }
 
 type ServiceDescription struct {
-	Host   string `json:"host"`
-	Path   string `json:"path"`
-	TLS    bool   `json:"tls"`
-	Target string `json:"target"`
-	State  string `json:"state"`
+	Hosts        nonNullList        `json:"hosts"`
+	PathPrefixes nonNullList        `json:"path_prefixes"`
+	TLS          bool               `json:"tls"`
+	Targets      nonNullList        `json:"targets"`
+	ReadTargets  nonNullList        `json:"read_targets"`
+	State        string             `json:"state"`
+	Rollout      RolloutDescription `json:"rollout"`
+}
+
+func (sd ServiceDescription) DisplayHosts() string {
+	return strings.Join(sd.Hosts, ",")
+}
+
+func (sd ServiceDescription) DisplayPaths() string {
+	return strings.Join(sd.PathPrefixes, ",")
+}
+
+func (sd ServiceDescription) DisplayTargets() string {
+	return strings.Join(slices.Concat(sd.Targets, sd.ReadTargets), ",")
+}
+
+type RolloutDescription struct {
+	Enabled     bool        `json:"enabled"`
+	Percentage  int         `json:"percentage"`
+	Allowlist   nonNullList `json:"allowlist"`
+	Targets     nonNullList `json:"targets"`
+	ReadTargets nonNullList `json:"read_targets"`
 }
 
 type ServiceDescriptionMap map[string]ServiceDescription
+
+type nonNullList []string
+
+func (l nonNullList) MarshalJSON() ([]byte, error) {
+	if l == nil {
+		return []byte("[]"), nil
+	}
+	return json.Marshal([]string(l))
+}
 
 func NewRouter(statePath string) *Router {
 	return &Router{
@@ -106,6 +149,10 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *Router) DeployService(name string, targetURLs, readerURLs []string, options ServiceOptions, targetOptions TargetOptions, deploymentOptions DeploymentOptions) error {
+	if err := options.Validate(); err != nil {
+		return err
+	}
+
 	options.Normalize()
 	slog.Info("Deploying", "service", name, "targets", targetURLs, "hosts", options.Hosts, "paths", options.PathPrefixes, "tls", options.TLSEnabled)
 
@@ -170,7 +217,7 @@ func (r *Router) SetRolloutSplit(name string, percent int, allowList []string) e
 	return service.SetRolloutSplit(percent, allowList)
 }
 
-func (r *Router) StopRollout(name string) error {
+func (r *Router) EnableRollout(name string) error {
 	defer r.saveStateSnapshot()
 
 	service := r.serviceForName(name)
@@ -178,7 +225,37 @@ func (r *Router) StopRollout(name string) error {
 		return ErrorServiceNotFound
 	}
 
-	return service.StopRollout()
+	return service.EnableRollout()
+}
+
+func (r *Router) DisableRollout(name string) error {
+	defer r.saveStateSnapshot()
+
+	service := r.serviceForName(name)
+	if service == nil {
+		return ErrorServiceNotFound
+	}
+
+	return service.DisableRollout()
+}
+
+func (r *Router) RemoveRolloutTargets(name string, drainTimeout time.Duration) error {
+	service := r.serviceForName(name)
+	if service == nil {
+		return ErrorServiceNotFound
+	}
+
+	removed, err := service.RemoveRollout()
+	if err != nil {
+		return err
+	}
+
+	_ = r.saveStateSnapshot()
+
+	removed.Dispose()
+	removed.DrainAll(drainTimeout)
+
+	return nil
 }
 
 func (r *Router) RemoveService(name string) error {
@@ -236,21 +313,7 @@ func (r *Router) ListActiveServices() ServiceDescriptionMap {
 	r.withReadLock(func() error {
 		for name, service := range r.services.All() {
 			if service.active != nil {
-				host := strings.Join(service.options.Hosts, ",")
-				if host == "" {
-					host = "*"
-				}
-
-				path := strings.Join(service.options.PathPrefixes, ",")
-				target := strings.Join(service.active.Targets().Names(), ",")
-
-				result[name] = ServiceDescription{
-					Host:   host,
-					Path:   path,
-					Target: target,
-					TLS:    service.options.TLSEnabled,
-					State:  service.pauseController.GetState().String(),
-				}
+				result[name] = service.Describe()
 			}
 		}
 		return nil

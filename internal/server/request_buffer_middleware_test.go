@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -65,4 +66,31 @@ func TestRequestBufferMiddleware_MalformedChunkedEncoding(t *testing.T) {
 	defer resp.Body.Close()
 
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestRequestBufferMiddleware_RemovesSpillFileWhenRequestEnds(t *testing.T) {
+	var spillFile string
+
+	middleware := WithRequestBufferMiddleware(4, 1024, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buffer, ok := r.Body.(*Buffer)
+		require.True(t, ok)
+		require.NotNil(t, buffer.diskBuffer, "expected the body to spill to disk")
+		spillFile = buffer.diskBuffer.Name()
+
+		// Read the body without closing it, like a downstream handler that
+		// leaves closing to whoever owns the body.
+		_, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest("POST", "http://app.example.com/somepath", strings.NewReader("a body larger than the memory buffer"))
+	rec := httptest.NewRecorder()
+
+	middleware.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Result().StatusCode)
+	require.NotEmpty(t, spillFile)
+
+	assert.NoFileExists(t, spillFile, "spill file should be removed once the request is done")
 }

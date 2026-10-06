@@ -20,8 +20,10 @@ var contextKeyRequestContext = contextKey("request-context")
 type loggingRequestContext struct {
 	Service         string
 	Target          string
+	Rollout         bool
 	RequestHeaders  []string
 	ResponseHeaders []string
+	ExcludeMetrics  bool
 }
 
 type LoggingMiddleware struct {
@@ -86,6 +88,7 @@ func (h *LoggingMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			slog.Int("status", writer.statusCode),
 			slog.String("service", loggingRequestContext.Service),
 			slog.String("target", loggingRequestContext.Target),
+			slog.Bool("rollout", loggingRequestContext.Rollout),
 			slog.Int64("duration", elapsed.Nanoseconds()),
 			slog.String("method", r.Method),
 			slog.Int64("req_content_length", r.ContentLength),
@@ -105,7 +108,9 @@ func (h *LoggingMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		attrs = append(attrs, h.retrieveCustomHeaders(loggingRequestContext.ResponseHeaders, writer.Header(), "resp")...)
 		h.logger.LogAttrs(context.Background(), slog.LevelInfo, "Request", attrs...)
 
-		metrics.Tracker.TrackRequest(loggingRequestContext.Service, r.Method, writer.statusCode, elapsed)
+		if !loggingRequestContext.ExcludeMetrics {
+			metrics.Tracker.TrackRequest(loggingRequestContext.Service, r.Method, writer.statusCode, loggingRequestContext.Rollout, elapsed)
+		}
 	}()
 
 	h.next.ServeHTTP(writer, r)
@@ -155,6 +160,10 @@ func (r *loggerResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 		r.statusCode = http.StatusSwitchingProtocols
 	}
 	return con, rw, err
+}
+
+func (r *loggerResponseWriter) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
 }
 
 func (r *loggerResponseWriter) Flush() {

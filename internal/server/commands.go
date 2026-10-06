@@ -58,8 +58,17 @@ type RolloutSetArgs struct {
 	Allowlist  []string
 }
 
-type RolloutStopArgs struct {
+type RolloutEnableArgs struct {
 	Service string
+}
+
+type RolloutDisableArgs struct {
+	Service string
+}
+
+type RolloutRemoveArgs struct {
+	Service      string
+	DrainTimeout time.Duration
 }
 
 type ListResponse struct {
@@ -146,6 +155,14 @@ func (h *CommandHandler) RolloutSet(args RolloutSetArgs, reply *bool) error {
 	return h.router.SetRolloutSplit(args.Service, args.Percentage, args.Allowlist)
 }
 
-func (h *CommandHandler) RolloutStop(args RolloutStopArgs, reply *bool) error {
-	return h.router.StopRollout(args.Service)
+func (h *CommandHandler) RolloutEnable(args RolloutEnableArgs, reply *bool) error {
+	return h.router.EnableRollout(args.Service)
+}
+
+func (h *CommandHandler) RolloutDisable(args RolloutDisableArgs, reply *bool) error {
+	return h.router.DisableRollout(args.Service)
+}
+
+func (h *CommandHandler) RolloutRemove(args RolloutRemoveArgs, reply *bool) error {
+	return h.router.RemoveRolloutTargets(args.Service, args.DrainTimeout)
 }

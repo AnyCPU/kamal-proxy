@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/basecamp/kamal-proxy/internal/server"
+	"github.com/basecamp/kamal-proxy/internal/version"
 )
 
 type runCommand struct {
@@ -29,12 +30,16 @@ func newRunCommand() *runCommand {
 	runCommand.cmd.Flags().IntVar(&globalConfig.HttpsPort, "https-port", getEnvInt("HTTPS_PORT", server.DefaultHttpsPort), "Port to serve HTTPS traffic on")
 	runCommand.cmd.Flags().IntVar(&globalConfig.MetricsPort, "metrics-port", getEnvInt("METRICS_PORT", 0), "Publish metrics on the specified port (default zero to disable)")
 	runCommand.cmd.Flags().BoolVar(&globalConfig.HTTP3Enabled, "http3", false, "Enable HTTP/3")
+	runCommand.cmd.Flags().DurationVar(&globalConfig.ReadHeaderTimeout, "read-header-timeout", getEnvDuration("READ_HEADER_TIMEOUT", server.DefaultReadHeaderTimeout), "Maximum time to wait for a client to send its request headers, or to complete a TLS handshake (zero to disable)")
+	runCommand.cmd.Flags().DurationVar(&globalConfig.IdleTimeout, "idle-timeout", getEnvDuration("IDLE_TIMEOUT", server.DefaultIdleTimeout), "Maximum time to keep an idle keep-alive connection open between requests (zero to disable)")
+	runCommand.cmd.Flags().DurationVar(&globalConfig.RequestBodyTimeout, "request-body-timeout", getEnvDuration("REQUEST_BODY_TIMEOUT", server.DefaultRequestBodyTimeout), "Maximum time to wait for a client to send more of its request body (zero to disable)")
 
 	return runCommand
 }
 
 func (c *runCommand) run(cmd *cobra.Command, args []string) error {
 	c.setLogger()
+	slog.Info("Starting kamal-proxy", "version", version.Version)
 
 	router := server.NewRouter(globalConfig.StatePath())
 	router.RestoreLastSavedState()

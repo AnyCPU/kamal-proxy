@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/gob"
 	"encoding/json"
-    "crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/acme/autocert"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -211,45 +216,45 @@ func TestRouter_UpdatingOptions(t *testing.T) {
 }
 
 func TestRouter_CanonicalHostRedirect(t *testing.T) {
-    router := testRouter(t)
-    _, target := testBackend(t, "first", http.StatusOK)
+	router := testRouter(t)
+	_, target := testBackend(t, "first", http.StatusOK)
 
-    serviceOptions := defaultServiceOptions
-    serviceOptions.Hosts = []string{"example.com", "www.example.com"}
-    serviceOptions.CanonicalHost = "example.com"
+	serviceOptions := defaultServiceOptions
+	serviceOptions.Hosts = []string{"example.com", "www.example.com"}
+	serviceOptions.CanonicalHost = "example.com"
 
-    require.NoError(t, router.DeployService("service1", []string{target}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions))
+	require.NoError(t, router.DeployService("service1", []string{target}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions))
 
-    statusCode, _ := sendGETRequest(router, "http://www.example.com/")
-    assert.Equal(t, http.StatusMovedPermanently, statusCode)
+	statusCode, _ := sendGETRequest(router, "http://www.example.com/")
+	assert.Equal(t, http.StatusMovedPermanently, statusCode)
 
-    statusCode, body := sendGETRequest(router, "http://example.com/")
-    assert.Equal(t, http.StatusOK, statusCode)
-    assert.Equal(t, "first", body)
+	statusCode, body := sendGETRequest(router, "http://example.com/")
+	assert.Equal(t, http.StatusOK, statusCode)
+	assert.Equal(t, "first", body)
 }
 
 func TestRouter_CanonicalHostRedirectWithTLS(t *testing.T) {
-    router := testRouter(t)
-    _, target := testBackend(t, "first", http.StatusOK)
+	router := testRouter(t)
+	_, target := testBackend(t, "first", http.StatusOK)
 
-    serviceOptions := defaultServiceOptions
-    serviceOptions.Hosts = []string{"example.com", "www.example.com"}
-    serviceOptions.CanonicalHost = "example.com"
-    serviceOptions.TLSEnabled = true
-    serviceOptions.TLSRedirect = true
+	serviceOptions := defaultServiceOptions
+	serviceOptions.Hosts = []string{"example.com", "www.example.com"}
+	serviceOptions.CanonicalHost = "example.com"
+	serviceOptions.TLSEnabled = true
+	serviceOptions.TLSRedirect = true
 
-    require.NoError(t, router.DeployService("service1", []string{target}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions))
+	require.NoError(t, router.DeployService("service1", []string{target}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions))
 
-    // Should go directly to https://example.com in a single redirect
-    statusCode, _ := sendGETRequest(router, "http://www.example.com/")
-    assert.Equal(t, http.StatusMovedPermanently, statusCode)
+	// Should go directly to https://example.com in a single redirect
+	statusCode, _ := sendGETRequest(router, "http://www.example.com/")
+	assert.Equal(t, http.StatusMovedPermanently, statusCode)
 
-    // HTTPS request to non-canonical host should redirect to canonical host but remain HTTPS
-    req := httptest.NewRequest(http.MethodGet, "https://www.example.com/", nil)
-    req.TLS = &tls.ConnectionState{}
-    w := httptest.NewRecorder()
-    router.ServeHTTP(w, req)
-    assert.Equal(t, http.StatusMovedPermanently, w.Result().StatusCode)
+	// HTTPS request to non-canonical host should redirect to canonical host but remain HTTPS
+	req := httptest.NewRequest(http.MethodGet, "https://www.example.com/", nil)
+	req.TLS = &tls.ConnectionState{}
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusMovedPermanently, w.Result().StatusCode)
 }
 
 func TestRouter_DeploymentsWithErrorsDoNotUpdateService(t *testing.T) {
@@ -563,6 +568,131 @@ func TestRouter_PathBasedRoutingStripPrefix(t *testing.T) {
 	assert.Equal(t, "/app", body)
 }
 
+func TestRouter_PathBasedRoutingMatchesCleanedPath(t *testing.T) {
+	router := testRouter(t)
+	_, root := testBackendWithHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("root " + r.RequestURI))
+	})
+	_, admin := testBackendWithHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("admin " + r.RequestURI))
+	})
+
+	serviceOptions := defaultServiceOptions
+	serviceOptions.Hosts = []string{"example.com"}
+	require.NoError(t, router.DeployService("root", []string{root}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions))
+	serviceOptions.PathPrefixes = []string{"/admin"}
+	require.NoError(t, router.DeployService("admin", []string{admin}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	tests := map[string]string{
+		"/admin/x":               "admin /admin/x",
+		"/admin/x/":              "admin /admin/x/",
+		"/admin/x?a=/../b":       "admin /admin/x?a=/../b",
+		"//admin/x":              "admin //admin/x",
+		"/admin//x":              "admin /admin//x",
+		"/./admin/x":             "admin /./admin/x",
+		"/%2e/admin/x":           "admin /%2e/admin/x",
+		"/other/../admin/x":      "admin /other/../admin/x",
+		"/other/%2e%2e/admin/x":  "admin /other/%2e%2e/admin/x",
+		"/other/%2E%2e/admin/x":  "admin /other/%2E%2e/admin/x",
+		"/other/.%2E/admin/x":    "admin /other/.%2E/admin/x",
+		"/../admin/x":            "admin /../admin/x",
+		"/admin/../x":            "root /admin/../x",
+		"/admin/%2e%2e/x":        "root /admin/%2e%2e/x",
+		"/admin/..":              "root /admin/..",
+		"/admin%2Fx":             "admin /admin%2Fx",
+		"/%61dmin/x":             "admin /%61dmin/x",
+		"/administrator/../x/./": "root /administrator/../x/./",
+		"/admin\\..\\x":          "root /admin%5C..%5Cx",
+		"/x/..\\admin/y":         "root /x/..%5Cadmin/y",
+	}
+
+	for path, expected := range tests {
+		statusCode, body := sendGETRequest(router, "http://example.com"+path)
+		assert.Equal(t, http.StatusOK, statusCode, path)
+		assert.Equal(t, expected, body, path)
+	}
+}
+
+func TestRouter_PathBasedRoutingStripPrefixForwardsCleanedPath(t *testing.T) {
+	router := testRouter(t)
+	_, backend := testBackendWithHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(r.RequestURI))
+	})
+
+	serviceOptions := defaultServiceOptions
+	serviceOptions.StripPrefix = true
+	serviceOptions.PathPrefixes = []string{"/admin"}
+	require.NoError(t, router.DeployService("admin", []string{backend}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	tests := map[string]string{
+		"/admin/x":       "/x",
+		"/admin":         "/",
+		"/admin/":        "/",
+		"//admin/x":      "/x",
+		"/./admin/x/":    "/x/",
+		"/admin/./x//y/": "/x/y/",
+		"/admin/a%2Fb/c": "/a/b/c",
+		"/admin/a%20b":   "/a%20b",
+		"/%61dmin/x":     "/x",
+	}
+
+	for path, expected := range tests {
+		statusCode, body := sendGETRequest(router, "http://example.com"+path)
+		assert.Equal(t, http.StatusOK, statusCode, path)
+		assert.Equal(t, expected, body, path)
+	}
+
+	statusCode, _ := sendGETRequest(router, "http://example.com/admin/..%2f..%2fsecret")
+	assert.Equal(t, http.StatusNotFound, statusCode)
+}
+
+func TestRouter_HostRoutingForwardsPathUntouched(t *testing.T) {
+	router := testRouter(t)
+	_, backend := testBackendWithHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(r.RequestURI))
+	})
+
+	require.NoError(t, router.DeployService("service1", []string{backend}, defaultEmptyReaders, defaultServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	for _, path := range []string{"//x", "/a/./b", "/a/../b", "/a/%2e%2e/b", "/a%2Fb"} {
+		statusCode, body := sendGETRequest(router, "http://example.com"+path)
+		assert.Equal(t, http.StatusOK, statusCode, path)
+		assert.Equal(t, path, body, path)
+	}
+}
+
+func TestRouter_HealthCheckWhilePausedWithPathPrefix(t *testing.T) {
+	router := testRouter(t)
+	_, backend := testBackend(t, "ok", http.StatusOK)
+
+	serviceOptions := defaultServiceOptions
+	serviceOptions.PathPrefixes = []string{"/api"}
+	serviceOptions.StripPrefix = true
+	require.NoError(t, router.DeployService("service1", []string{backend}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	serviceOptions = defaultServiceOptions
+	serviceOptions.PathPrefixes = []string{"/admin"}
+	serviceOptions.StripPrefix = false
+	targetOptions := defaultTargetOptions
+	targetOptions.HealthCheckConfig.Path = "/admin/up"
+	require.NoError(t, router.DeployService("service2", []string{backend}, defaultEmptyReaders, serviceOptions, targetOptions, defaultDeploymentOptions))
+
+	require.NoError(t, router.PauseService("service1", time.Second, time.Millisecond*10))
+	require.NoError(t, router.PauseService("service2", time.Second, time.Millisecond*10))
+
+	// Health checks succeed while paused, with the health check path matched
+	// against the target's view of the path
+	statusCode, _ := sendGETRequest(router, "http://example.com/api/up")
+	assert.Equal(t, http.StatusOK, statusCode)
+
+	statusCode, _ = sendGETRequest(router, "http://example.com/admin/up")
+	assert.Equal(t, http.StatusOK, statusCode)
+
+	// Other requests are still paused
+	statusCode, _ = sendGETRequest(router, "http://example.com/api/other")
+	assert.Equal(t, http.StatusGatewayTimeout, statusCode)
+}
+
 func TestRouter_PathBasedRoutingWithHosts(t *testing.T) {
 	router := testRouter(t)
 	_, first := testBackend(t, "first", http.StatusOK)
@@ -703,6 +833,13 @@ func TestRouter_EnablingRollout(t *testing.T) {
 	_, second := testBackend(t, "second", http.StatusOK)
 
 	require.NoError(t, router.DeployService("service1", []string{first}, defaultEmptyReaders, defaultServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	assert.Equal(t, ErrorRolloutTargetNotSet, router.SetRolloutSplit("service1", 0, []string{"1"}))
+	assert.Equal(t, ErrorRolloutTargetNotSet, router.EnableRollout("service1"))
+	assert.Equal(t, ErrorRolloutTargetNotSet, router.DisableRollout("service1"))
+	assert.Equal(t, ErrorServiceNotFound, router.EnableRollout("service2"))
+	assert.Equal(t, ErrorServiceNotFound, router.DisableRollout("service2"))
+
 	require.NoError(t, router.SetRolloutTargets("service1", []string{second}, defaultEmptyReaders, defaultDeploymentOptions))
 
 	checkResponse := func(expected string) {
@@ -716,13 +853,173 @@ func TestRouter_EnablingRollout(t *testing.T) {
 	checkResponse("first")
 
 	require.NoError(t, router.SetRolloutSplit("service1", 0, []string{"1"}))
+	checkResponse("first")
+
+	require.NoError(t, router.EnableRollout("service1"))
+	checkResponse("second")
+
+	require.NoError(t, router.DisableRollout("service1"))
+	checkResponse("first")
+
+	require.NoError(t, router.EnableRollout("service1"))
 	checkResponse("second")
 
 	require.NoError(t, router.SetRolloutSplit("service1", 0, []string{"2"}))
 	checkResponse("first")
 
-	require.NoError(t, router.StopRollout("service1"))
+	require.NoError(t, router.SetRolloutSplit("service1", 0, []string{"1"}))
+	checkResponse("second")
+}
+
+func TestRouter_EnablingRolloutBeforeSettingSplit(t *testing.T) {
+	router := testRouter(t)
+	_, first := testBackend(t, "first", http.StatusOK)
+	_, second := testBackend(t, "second", http.StatusOK)
+
+	require.NoError(t, router.DeployService("service1", []string{first}, defaultEmptyReaders, defaultServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
+	require.NoError(t, router.SetRolloutTargets("service1", []string{second}, defaultEmptyReaders, defaultDeploymentOptions))
+
+	checkResponse := func(expected string) {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		req.AddCookie(&http.Cookie{Name: "kamal-rollout", Value: "1"})
+		statusCode, body := sendRequest(router, req)
+		assert.Equal(t, http.StatusOK, statusCode)
+		assert.Equal(t, expected, body)
+	}
+
+	require.NoError(t, router.EnableRollout("service1"))
 	checkResponse("first")
+
+	require.NoError(t, router.SetRolloutSplit("service1", 0, []string{"1"}))
+	checkResponse("second")
+}
+
+func TestRouter_RemovingRollout(t *testing.T) {
+	router := testRouter(t)
+	_, first := testBackend(t, "first", http.StatusOK)
+	_, second := testBackend(t, "second", http.StatusOK)
+
+	require.NoError(t, router.DeployService("service1", []string{first}, defaultEmptyReaders, defaultServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
+	assert.Equal(t, ErrorRolloutTargetNotSet, router.RemoveRolloutTargets("service1", DefaultDrainTimeout))
+	assert.Equal(t, ErrorServiceNotFound, router.RemoveRolloutTargets("service2", DefaultDrainTimeout))
+
+	require.NoError(t, router.SetRolloutTargets("service1", []string{second}, defaultEmptyReaders, defaultDeploymentOptions))
+	require.NoError(t, router.SetRolloutSplit("service1", 0, []string{"1"}))
+	require.NoError(t, router.EnableRollout("service1"))
+
+	checkResponse := func(expected string) {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		req.AddCookie(&http.Cookie{Name: "kamal-rollout", Value: "1"})
+		statusCode, body := sendRequest(router, req)
+		assert.Equal(t, http.StatusOK, statusCode)
+		assert.Equal(t, expected, body)
+	}
+
+	checkResponse("second")
+
+	require.NoError(t, router.RemoveRolloutTargets("service1", DefaultDrainTimeout))
+	checkResponse("first")
+
+	assert.Equal(t, ErrorRolloutTargetNotSet, router.SetRolloutSplit("service1", 0, []string{"1"}))
+}
+
+func TestRouter_ListActiveServices(t *testing.T) {
+	router := testRouter(t)
+	_, first := testBackend(t, "first", http.StatusOK)
+	_, second := testBackend(t, "second", http.StatusOK)
+	_, third := testBackend(t, "third", http.StatusOK)
+	_, fourth := testBackend(t, "fourth", http.StatusOK)
+
+	_, reader := testBackend(t, "reader", http.StatusOK)
+
+	tlsServiceOptions := defaultServiceOptions
+	tlsServiceOptions.Hosts = []string{"example.com"}
+	tlsServiceOptions.TLSEnabled = true
+	require.NoError(t, router.DeployService("service1", []string{first}, []string{reader}, tlsServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	pathServiceOptions := defaultServiceOptions
+	pathServiceOptions.PathPrefixes = []string{"/app"}
+	require.NoError(t, router.DeployService("service2", []string{second}, defaultEmptyReaders, pathServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	mixedHostServiceOptions := defaultServiceOptions
+	mixedHostServiceOptions.Hosts = []string{"example.org", ""}
+	require.NoError(t, router.DeployService("service3", []string{fourth}, defaultEmptyReaders, mixedHostServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	services := router.ListActiveServices()
+	assert.Len(t, services, 3)
+
+	service1 := services["service1"]
+	assert.Equal(t, nonNullList{"example.com"}, service1.Hosts)
+	assert.Equal(t, nonNullList{"/"}, service1.PathPrefixes)
+	assert.Equal(t, nonNullList{first}, service1.Targets)
+	assert.Equal(t, nonNullList{reader}, service1.ReadTargets)
+	assert.True(t, service1.TLS)
+	assert.Equal(t, "running", service1.State)
+	assert.Equal(t, RolloutDescription{Allowlist: nonNullList{}}, service1.Rollout)
+
+	service2 := services["service2"]
+	assert.Equal(t, nonNullList{"*"}, service2.Hosts)
+	assert.Equal(t, nonNullList{"/app"}, service2.PathPrefixes)
+	assert.Equal(t, nonNullList{second}, service2.Targets)
+	assert.Empty(t, service2.ReadTargets)
+	assert.False(t, service2.TLS)
+	assert.Equal(t, "running", service2.State)
+	assert.False(t, service2.Rollout.Enabled)
+
+	assert.Equal(t, nonNullList{"example.org", "*"}, services["service3"].Hosts)
+
+	require.NoError(t, router.PauseService("service1", time.Second, time.Second))
+
+	services = router.ListActiveServices()
+	assert.Equal(t, "paused", services["service1"].State)
+	assert.Equal(t, "running", services["service2"].State)
+
+	require.NoError(t, router.ResumeService("service1"))
+	require.NoError(t, router.SetRolloutTargets("service2", []string{third}, defaultEmptyReaders, defaultDeploymentOptions))
+
+	services = router.ListActiveServices()
+	assert.Equal(t, nonNullList{third}, services["service2"].Rollout.Targets)
+	assert.False(t, services["service2"].Rollout.Enabled)
+
+	require.NoError(t, router.SetRolloutSplit("service2", 50, []string{"key1"}))
+	require.NoError(t, router.EnableRollout("service2"))
+
+	services = router.ListActiveServices()
+	assert.Equal(t, "running", services["service1"].State)
+	assert.False(t, services["service1"].Rollout.Enabled)
+	assert.Equal(t, RolloutDescription{
+		Enabled:     true,
+		Percentage:  50,
+		Allowlist:   nonNullList{"key1"},
+		Targets:     nonNullList{third},
+		ReadTargets: nonNullList{},
+	}, services["service2"].Rollout)
+
+	require.NoError(t, router.DisableRollout("service2"))
+
+	services = router.ListActiveServices()
+	rollout := services["service2"].Rollout
+	assert.False(t, rollout.Enabled)
+	assert.Equal(t, 50, rollout.Percentage)
+	assert.Equal(t, nonNullList{"key1"}, rollout.Allowlist)
+}
+
+func TestRouter_ListActiveServices_EmptyListsSurviveGobAsJSON(t *testing.T) {
+	router := testRouter(t)
+	_, target := testBackend(t, "first", http.StatusOK)
+	require.NoError(t, router.DeployService("service1", []string{target}, defaultEmptyReaders, defaultServiceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	var buffer bytes.Buffer
+	require.NoError(t, gob.NewEncoder(&buffer).Encode(router.ListActiveServices()))
+
+	var services ServiceDescriptionMap
+	require.NoError(t, gob.NewDecoder(&buffer).Decode(&services))
+
+	output, err := json.Marshal(services)
+	require.NoError(t, err)
+	assert.NotContains(t, string(output), "null")
+	assert.Contains(t, string(output), `"read_targets":[]`)
+	assert.Contains(t, string(output), `"allowlist":[]`)
 }
 
 func TestRouter_RestoreLastSavedState(t *testing.T) {
@@ -769,6 +1066,41 @@ func TestRouter_RestoreLastSavedState(t *testing.T) {
 	statusCode, body = sendGETRequest(router, "https://other.example.com/api")
 	assert.Equal(t, http.StatusOK, statusCode)
 	assert.Equal(t, "third", body)
+}
+
+func TestRouter_RestoreLastSavedState_TLSOnDemandURL(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+
+	allowServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("host") == "allowed.example.com" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer allowServer.Close()
+
+	_, target := testBackend(t, "first", http.StatusOK)
+
+	serviceOptions := defaultServiceOptions
+	serviceOptions.TLSEnabled = true
+	serviceOptions.TLSOnDemandURL = allowServer.URL
+
+	router := NewRouter(statePath)
+	require.NoError(t, router.DeployService("ondemand", []string{target}, defaultEmptyReaders, serviceOptions, defaultTargetOptions, defaultDeploymentOptions))
+
+	router = NewRouter(statePath)
+	require.NoError(t, router.RestoreLastSavedState())
+
+	service := router.services.Get("ondemand")
+	require.NotNil(t, service)
+
+	manager, ok := service.certManager.(*autocert.Manager)
+	require.True(t, ok)
+	require.NotNil(t, manager.HostPolicy)
+
+	assert.NoError(t, manager.HostPolicy(context.Background(), "allowed.example.com"))
+	assert.Error(t, manager.HostPolicy(context.Background(), "denied.example.com"))
 }
 
 // Helpers

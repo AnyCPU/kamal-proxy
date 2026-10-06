@@ -16,7 +16,7 @@ func newRolloutSetCommand() *rolloutSetCommand {
 	rolloutSetCommand := &rolloutSetCommand{}
 	rolloutSetCommand.cmd = &cobra.Command{
 		Use:       "set <service>",
-		Short:     "Set traffic split for rollout",
+		Short:     "Set the rollout split",
 		RunE:      rolloutSetCommand.run,
 		Args:      cobra.ExactArgs(1),
 		ValidArgs: []string{"service"},

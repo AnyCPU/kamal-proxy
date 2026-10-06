@@ -12,7 +12,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"regexp"
-	"strings"
 	"sync"
 	"time"
 )
@@ -77,7 +76,7 @@ type TargetOptions struct {
 }
 
 func (to *TargetOptions) IsHealthCheckRequest(r *http.Request) bool {
-	return (r.Method == http.MethodGet || r.Method == http.MethodHead) && r.URL.Path == to.HealthCheckConfig.Path
+	return (r.Method == http.MethodGet || r.Method == http.MethodHead) && RoutedTargetPath(r) == to.HealthCheckConfig.Path
 }
 
 func (to *TargetOptions) canonicalizeLogHeaders() {
@@ -221,7 +220,8 @@ func (t *Target) BeginHealthChecks(stateConsumer TargetStateConsumer) {
 
 	t.withInflightLock(func() {
 		healthCheckURL := t.buildHealthCheckURL()
-		t.healthcheck = NewHealthCheck(t,
+		t.healthcheck = NewHealthCheck(
+			t,
 			healthCheckURL,
 			t.options.HealthCheckConfig.Interval,
 			t.options.HealthCheckConfig.Timeout,
@@ -310,9 +310,9 @@ func (t *Target) rewrite(req *httputil.ProxyRequest) {
 	req.SetURL(t.targetURL)
 	req.Out.Host = req.In.Host
 
-	routingContext := RoutingContext(req.In)
-	if routingContext != nil {
-		req.Out.URL.Path = strings.TrimPrefix(req.Out.URL.Path, routingContext.MatchedPrefix)
+	if RoutingContext(req.In) != nil {
+		req.Out.URL.Path = RoutedTargetPath(req.In)
+		req.Out.URL.RawPath = ""
 	}
 
 	// Ensure query params are preserved exactly, including those we could not
@@ -364,6 +364,12 @@ func (t *Target) handleProxyError(w http.ResponseWriter, r *http.Request, err er
 		return
 	}
 
+	if t.isRequestBodyTimeout(err) || requestBodyTimedOut(r) {
+		slog.Info("Timed out reading request body", "target", t.Address(), "path", r.URL.Path, "error", err)
+		SetErrorResponse(w, r, http.StatusRequestTimeout, nil)
+		return
+	}
+
 	if t.isGatewayTimeout(err) {
 		SetErrorResponse(w, r, http.StatusGatewayTimeout, nil)
 		return
@@ -397,9 +403,12 @@ func (t *Target) isRequestEntityTooLarge(err error) bool {
 	return errors.As(err, &maxBytesError)
 }
 
+func (t *Target) isRequestBodyTimeout(err error) bool {
+	return errors.Is(err, ErrRequestBodyTimeout)
+}
+
 func (t *Target) isGatewayTimeout(err error) bool {
-	var netErr net.Error
-	if errors.As(err, &netErr) {
+	if netErr, ok := errors.AsType[net.Error](err); ok {
 		return netErr.Timeout()
 	}
 	return false

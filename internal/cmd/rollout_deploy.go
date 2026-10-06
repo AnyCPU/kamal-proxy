@@ -16,7 +16,7 @@ func newRolloutDeployCommand() *rolloutDeployCommand {
 	rolloutDeployCommand := &rolloutDeployCommand{}
 	rolloutDeployCommand.cmd = &cobra.Command{
 		Use:       "deploy <service>",
-		Short:     "Deploy the rollout target",
+		Short:     "Deploy the rollout target(s)",
 		RunE:      rolloutDeployCommand.run,
 		Args:      cobra.ExactArgs(1),
 		ValidArgs: []string{"service"},

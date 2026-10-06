@@ -1,10 +1,12 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -42,6 +44,10 @@ const (
 	MaxIdleConnsPerHost = 100
 	ProxyBufferSize     = 32 * KB
 
+	DefaultReadHeaderTimeout  = time.Second * 10
+	DefaultIdleTimeout        = time.Second * 60
+	DefaultRequestBodyTimeout = time.Second * 60
+
 	DefaultTargetTimeout       = time.Second * 30
 	DefaultMaxMemoryBufferSize = 1 * MB
 	DefaultMaxRequestBodySize  = 0
@@ -54,7 +60,22 @@ var (
 	ErrorRolloutTargetNotSet                 = errors.New("rollout target not set")
 	ErrorUnableToLoadErrorPages              = errors.New("unable to load error pages")
 	ErrorAutomaticTLSDoesNotSupportWildcards = errors.New("automatic TLS does not support wildcards")
+	ErrServiceOptionsInvalid                 = errors.New("service options invalid")
+
+	contextKeyInternalRequest = contextKey("internal-request")
 )
+
+// markInternalRequest marks the context as belonging to an internal request:
+// one synthesized inside the proxy itself, such as a TLS on-demand check
+// probe, rather than arriving over a client connection.
+func markInternalRequest(ctx context.Context) context.Context {
+	return context.WithValue(ctx, contextKeyInternalRequest, true)
+}
+
+func isInternalRequest(r *http.Request) bool {
+	internal, _ := r.Context().Value(contextKeyInternalRequest).(bool)
+	return internal
+}
 
 type TargetSlot int
 
@@ -83,6 +104,7 @@ type ServiceOptions struct {
 	TLSEnabled                  bool          `json:"tls_enabled"`
 	TLSCertificatePath          string        `json:"tls_certificate_path"`
 	TLSPrivateKeyPath           string        `json:"tls_private_key_path"`
+	TLSOnDemandURL              string        `json:"tls_on_demand_url"`
 	TLSRedirect                 bool          `json:"tls_redirect"`
 	CanonicalHost               string        `json:"canonical_host"`
 	ACMEDirectory               string        `json:"acme_directory"`
@@ -91,6 +113,12 @@ type ServiceOptions struct {
 	StripPrefix                 bool          `json:"strip_prefix"`
 	WriterAffinityTimeout       time.Duration `json:"writer_affinity_timeout"`
 	ReadTargetsAcceptWebsockets bool          `json:"read_targets_accept_websockets"`
+	ExcludeMetricsPaths         []string      `json:"exclude_metrics_paths"`
+	ClientIPHeader              string        `json:"client_ip_header"`
+}
+
+func (so *ServiceOptions) ShouldExcludeMetrics(r *http.Request) bool {
+	return slices.Contains(so.ExcludeMetricsPaths, RoutedTargetPath(r))
 }
 
 func (so *ServiceOptions) Normalize() {
@@ -98,10 +126,56 @@ func (so *ServiceOptions) Normalize() {
 	so.PathPrefixes = NormalizePathPrefixes(so.PathPrefixes)
 }
 
+func (so ServiceOptions) Validate() error {
+	so.Normalize()
+
+	if so.TLSOnDemandURL != "" && !so.TLSEnabled {
+		return fmt.Errorf("%w: TLS must be enabled to use a TLS on-demand URL", ErrServiceOptionsInvalid)
+	}
+
+	if so.TLSEnabled {
+		if so.TLSOnDemandURL != "" {
+			if so.HasConfiguredHosts() {
+				return fmt.Errorf("%w: cannot set hosts when using a TLS on-demand URL", ErrServiceOptionsInvalid)
+			}
+
+			if so.TLSCertificatePath != "" || so.TLSPrivateKeyPath != "" {
+				return fmt.Errorf("%w: cannot use a custom TLS certificate with a TLS on-demand URL", ErrServiceOptionsInvalid)
+			}
+
+			if so.CanonicalHost != "" {
+				return fmt.Errorf("%w: cannot set a canonical host when using a TLS on-demand URL", ErrServiceOptionsInvalid)
+			}
+
+			if err := validateTLSOnDemandURL(so.TLSOnDemandURL); err != nil {
+				return fmt.Errorf("%w: %w", ErrServiceOptionsInvalid, err)
+			}
+		} else if !so.HasConfiguredHosts() {
+			return fmt.Errorf("%w: host must be set when using TLS", ErrServiceOptionsInvalid)
+		}
+
+		if !slices.Contains(so.PathPrefixes, rootPath) {
+			return fmt.Errorf("%w: TLS settings must be specified on the root path service", ErrServiceOptionsInvalid)
+		}
+	}
+
+	if so.CanonicalHost != "" && len(so.Hosts) > 0 && so.Hosts[0] != "" {
+		if !slices.Contains(so.Hosts, so.CanonicalHost) {
+			return fmt.Errorf("%w: canonical-host '%s' must be present in the hosts list: %v", ErrServiceOptionsInvalid, so.CanonicalHost, so.Hosts)
+		}
+	}
+
+	return nil
+}
+
 func (so *ServiceOptions) WithHosts(hosts []string) ServiceOptions {
 	options := *so
 	options.Hosts = hosts
 	return options
+}
+
+func (so ServiceOptions) HasConfiguredHosts() bool {
+	return len(so.Hosts) > 0 && !slices.Contains(so.Hosts, "")
 }
 
 func (so *ServiceOptions) WithPathPrefixes(pathPrefixes []string) ServiceOptions {
@@ -156,9 +230,11 @@ func (s *Service) UpdateOptions(options ServiceOptions, targetOptions TargetOpti
 }
 
 func (s *Service) Dispose() {
-	s.active.Dispose()
-	if s.rollout != nil {
-		s.rollout.Dispose()
+	active, rollout := s.loadBalancers()
+
+	active.Dispose()
+	if rollout != nil {
+		rollout.Dispose()
 	}
 }
 
@@ -187,23 +263,61 @@ func (s *Service) SetRolloutSplit(percentage int, allowlist []string) error {
 		return ErrorRolloutTargetNotSet
 	}
 
-	s.rolloutController = NewRolloutController(percentage, allowlist)
+	s.rolloutController = s.currentRolloutController().WithSplit(percentage, allowlist)
 	slog.Info("Set rollout split", "service", s.name, "percentage", percentage, "allowlist", allowlist)
 	return nil
 }
 
-func (s *Service) StopRollout() error {
+func (s *Service) EnableRollout() error {
+	return s.setRolloutEnabled(true)
+}
+
+func (s *Service) DisableRollout() error {
+	return s.setRolloutEnabled(false)
+}
+
+func (s *Service) setRolloutEnabled(enabled bool) error {
 	s.serviceLock.Lock()
 	defer s.serviceLock.Unlock()
 
-	s.rolloutController = nil
-	slog.Info("Stopped rollout", "service", s.name)
+	if s.rollout == nil {
+		return ErrorRolloutTargetNotSet
+	}
+
+	s.rolloutController = s.currentRolloutController().WithEnabled(enabled)
+	slog.Info("Set rollout state", "service", s.name, "enabled", enabled)
 	return nil
 }
 
+func (s *Service) currentRolloutController() *RolloutController {
+	if s.rolloutController == nil {
+		return NewRolloutController(0, []string{})
+	}
+	return s.rolloutController
+}
+
+func (s *Service) RemoveRollout() (*LoadBalancer, error) {
+	s.serviceLock.Lock()
+	defer s.serviceLock.Unlock()
+
+	if s.rollout == nil {
+		return nil, ErrorRolloutTargetNotSet
+	}
+
+	removed := s.rollout
+	s.rollout = nil
+	s.rolloutController = nil
+	slog.Info("Removed rollout targets", "service", s.name)
+	return removed, nil
+}
+
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	metrics.Tracker.AddInflightRequest(s.name)
-	defer metrics.Tracker.SubtractInflightRequest(s.name)
+	if s.options.ShouldExcludeMetrics(r) {
+		LoggingRequestContext(r).ExcludeMetrics = true
+	} else {
+		metrics.Tracker.AddInflightRequest(s.name)
+		defer metrics.Tracker.SubtractInflightRequest(s.name)
+	}
 
 	s.middleware.ServeHTTP(w, r)
 }
@@ -225,24 +339,64 @@ type marshalledService struct {
 	LegacyPathPrefixes  []string `json:"path_prefixes,omitempty"`
 }
 
-func (s *Service) MarshalJSON() ([]byte, error) {
-	var rolloutTargets []string
-	var rolloutReaders []string
-	if s.rollout != nil {
-		rolloutTargets = s.rollout.WriteTargets().Names()
-		rolloutReaders = s.rollout.ReadTargets().Names()
+func (s *Service) Describe() ServiceDescription {
+	s.serviceLock.RLock()
+	active, rollout, controller := s.active, s.rollout, s.currentRolloutController()
+	s.serviceLock.RUnlock()
+
+	hosts := make([]string, 0, len(s.options.Hosts))
+	for _, host := range s.options.Hosts {
+		if host == "" {
+			host = "*"
+		}
+		hosts = append(hosts, host)
 	}
+
+	targets, readers := targetNames(active)
+	rolloutTargets, rolloutReaders := targetNames(rollout)
+
+	return ServiceDescription{
+		Hosts:        hosts,
+		PathPrefixes: s.options.PathPrefixes,
+		Targets:      targets,
+		ReadTargets:  readers,
+		TLS:          s.options.TLSEnabled,
+		State:        s.pauseController.GetState().String(),
+		Rollout: RolloutDescription{
+			Enabled:     controller.Enabled,
+			Percentage:  controller.Percentage,
+			Allowlist:   controller.Allowlist,
+			Targets:     rolloutTargets,
+			ReadTargets: rolloutReaders,
+		},
+	}
+}
+
+func targetNames(lb *LoadBalancer) (targets, readers []string) {
+	if lb == nil {
+		return nil, nil
+	}
+	return lb.WriteTargets().Names(), lb.ReadTargets().Names()
+}
+
+func (s *Service) MarshalJSON() ([]byte, error) {
+	s.serviceLock.RLock()
+	active, rollout, rolloutController := s.active, s.rollout, s.rolloutController
+	s.serviceLock.RUnlock()
+
+	activeTargets, activeReaders := targetNames(active)
+	rolloutTargets, rolloutReaders := targetNames(rollout)
 
 	return json.Marshal(marshalledService{
 		Name:              s.name,
-		ActiveTargets:     s.active.WriteTargets().Names(),
-		ActiveReaders:     s.active.ReadTargets().Names(),
+		ActiveTargets:     activeTargets,
+		ActiveReaders:     activeReaders,
 		RolloutTargets:    rolloutTargets,
 		RolloutReaders:    rolloutReaders,
 		Options:           s.options,
 		TargetOptions:     s.targetOptions,
 		PauseController:   s.pauseController,
-		RolloutController: s.rolloutController,
+		RolloutController: rolloutController,
 	})
 }
 
@@ -349,22 +503,32 @@ func (s *Service) initialize(options ServiceOptions, targetOptions TargetOptions
 }
 
 func (s *Service) Drain(timeout time.Duration) {
+	active, rollout := s.loadBalancers()
+
 	PerformConcurrently(
 		func() {
-			s.active.DrainAll(timeout)
+			active.DrainAll(timeout)
 		},
 		func() {
-			if s.rollout != nil {
-				s.rollout.DrainAll(timeout)
+			if rollout != nil {
+				rollout.DrainAll(timeout)
 			}
 		},
 	)
+}
+
+func (s *Service) loadBalancers() (active, rollout *LoadBalancer) {
+	s.serviceLock.RLock()
+	defer s.serviceLock.RUnlock()
+
+	return s.active, s.rollout
 }
 
 func (s *Service) loadBalancerForRequest(req *http.Request) *LoadBalancer {
 	lb := s.active
 	if s.rollout != nil && s.rolloutController != nil && s.rolloutController.RequestUsesRolloutGroup(req) {
 		slog.Debug("Using rollout for request", "service", s.name, "path", req.URL.Path)
+		LoggingRequestContext(req).Rollout = true
 		lb = s.rollout
 	}
 
@@ -392,12 +556,31 @@ func (s *Service) createCertManager(options ServiceOptions) (CertManager, error)
 		}
 	}
 
+	certCache := autocert.DirCache(options.ScopedCachePath())
+
+	hostPolicy, err := s.createHostPolicy(options, certCache)
+	if err != nil {
+		return nil, err
+	}
+
 	return &autocert.Manager{
 		Prompt:     autocert.AcceptTOS,
-		Cache:      autocert.DirCache(options.ScopedCachePath()),
-		HostPolicy: autocert.HostWhitelist(options.Hosts...),
+		Cache:      certCache,
+		HostPolicy: hostPolicy,
 		Client:     &acme.Client{DirectoryURL: options.ACMEDirectory},
 	}, nil
+}
+
+func (s *Service) createHostPolicy(options ServiceOptions, certCache autocert.Cache) (autocert.HostPolicy, error) {
+	if options.TLSOnDemandURL != "" {
+		checker, err := newTLSOnDemandChecker(s, options.TLSOnDemandURL, certCache)
+		if err != nil {
+			return nil, err
+		}
+		return checker.hostPolicy(), nil
+	}
+
+	return autocert.HostWhitelist(options.Hosts...), nil
 }
 
 func (s *Service) createMiddleware(options ServiceOptions, certManager CertManager) (http.Handler, error) {
@@ -417,6 +600,10 @@ func (s *Service) createMiddleware(options ServiceOptions, certManager CertManag
 	if certManager != nil {
 		slog.Debug("Using ACME handler", "service", s.name)
 		handler = certManager.HTTPHandler(handler)
+	}
+
+	if options.ClientIPHeader != "" {
+		handler = WithClientIPMiddleware(options.ClientIPHeader, handler)
 	}
 
 	return handler, nil
@@ -491,28 +678,30 @@ func (s *Service) handleRedirectsIfNeeded(w http.ResponseWriter, r *http.Request
 // TLS redirection or canonical host redirection should occur. If no redirect is
 // needed, it returns an empty string.
 func (s *Service) redirectURLIfNeeded(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.Host)
-	if err != nil {
-		host = r.Host
-	}
+	if !isInternalRequest(r) {
+		host, _, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			host = r.Host
+		}
 
-	currentScheme := "http"
-	if r.TLS != nil {
-		currentScheme = "https"
-	}
+		currentScheme := "http"
+		if r.TLS != nil {
+			currentScheme = "https"
+		}
 
-	desiredScheme := currentScheme
-	if s.options.TLSEnabled && s.options.TLSRedirect && currentScheme == "http" {
-		desiredScheme = "https"
-	}
+		desiredScheme := currentScheme
+		if s.options.TLSEnabled && s.options.TLSRedirect && currentScheme == "http" {
+			desiredScheme = "https"
+		}
 
-	desiredHost := host
-	if s.options.CanonicalHost != "" && host != s.options.CanonicalHost {
-		desiredHost = s.options.CanonicalHost
-	}
+		desiredHost := host
+		if s.options.CanonicalHost != "" && host != s.options.CanonicalHost {
+			desiredHost = s.options.CanonicalHost
+		}
 
-	if desiredScheme != currentScheme || desiredHost != host {
-		return desiredScheme + "://" + desiredHost + r.URL.RequestURI()
+		if desiredScheme != currentScheme || desiredHost != host {
+			return desiredScheme + "://" + desiredHost + r.URL.RequestURI()
+		}
 	}
 
 	return ""

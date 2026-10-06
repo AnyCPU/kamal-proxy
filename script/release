@@ -28,6 +28,8 @@ docker buildx build \
   --tag basecamp/kamal-proxy:${TAG} \
   --tag basecamp/kamal-proxy:latest \
   --label "org.opencontainers.image.title=kamal-proxy" \
+  --label "org.opencontainers.image.version=${TAG}" \
+  --build-arg VERSION=${TAG} \
   --push .
 
 git push origin tag ${TAG}

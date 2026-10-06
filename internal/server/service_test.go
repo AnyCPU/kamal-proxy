@@ -2,7 +2,9 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -24,6 +26,49 @@ func TestService_ServeRequest(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Result().StatusCode)
 }
 
+func TestService_ClientIPHeaderRewritesXForwardedFor(t *testing.T) {
+	var xForwardedFor, trueClientIP string
+
+	serviceOptions := defaultServiceOptions
+	serviceOptions.ClientIPHeader = "True-Client-IP"
+
+	targetOptions := defaultTargetOptions
+	targetOptions.ForwardHeaders = true
+
+	service := testCreateServiceWithHandler(t, serviceOptions, targetOptions,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != defaultHealthCheckConfig.Path {
+				xForwardedFor = r.Header.Get("X-Forwarded-For")
+				trueClientIP = r.Header.Get("True-Client-IP")
+			}
+		}))
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.Header.Set("True-Client-IP", "203.0.113.9")
+	req.Header.Set("X-Forwarded-For", "6.6.6.6")
+
+	clientIP, _, err := net.SplitHostPort(req.RemoteAddr)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	service.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Result().StatusCode)
+	require.Equal(t, "203.0.113.9, "+clientIP, xForwardedFor)
+	require.Equal(t, "203.0.113.9", trueClientIP)
+
+	// Without the trusted header, the client-supplied X-Forwarded-For is
+	// forwarded unmodified, as usual.
+	req = httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.Header.Set("X-Forwarded-For", "6.6.6.6")
+
+	w = httptest.NewRecorder()
+	service.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Result().StatusCode)
+	require.Equal(t, "6.6.6.6, "+clientIP, xForwardedFor)
+}
+
 func TestService_RedirectToHTTPSWhenTLSRequired(t *testing.T) {
 	service := testCreateService(t, ServiceOptions{Hosts: []string{"example.com"}, TLSEnabled: true, TLSRedirect: true}, defaultTargetOptions)
 
@@ -43,10 +88,57 @@ func TestService_RedirectToHTTPSWhenTLSRequired(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Result().StatusCode)
 }
 
+func TestServiceOptions_HasConfiguredHosts(t *testing.T) {
+	require.False(t, ServiceOptions{}.HasConfiguredHosts())
+	require.False(t, ServiceOptions{Hosts: []string{""}}.HasConfiguredHosts())
+	require.False(t, ServiceOptions{Hosts: []string{"*.example.com", ""}}.HasConfiguredHosts())
+	require.True(t, ServiceOptions{Hosts: []string{"example.com"}}.HasConfiguredHosts())
+	require.True(t, ServiceOptions{Hosts: []string{"*.example.com"}}.HasConfiguredHosts())
+}
+
+func TestServiceOptions_Validate(t *testing.T) {
+	assertValid := func(options ServiceOptions) {
+		t.Helper()
+		require.NoError(t, options.Validate())
+	}
+
+	assertNotValid := func(options ServiceOptions, expected string) {
+		t.Helper()
+		err := options.Validate()
+		require.ErrorContains(t, err, expected)
+		require.ErrorIs(t, err, ErrServiceOptionsInvalid)
+	}
+
+	assertNotValid(ServiceOptions{TLSEnabled: true}, "host must be set when using TLS")
+	assertNotValid(ServiceOptions{Hosts: []string{""}, TLSEnabled: true}, "host must be set when using TLS")
+	assertNotValid(ServiceOptions{Hosts: []string{"*.example.com", ""}, TLSEnabled: true}, "host must be set when using TLS")
+
+	assertValid(ServiceOptions{Hosts: []string{"example.com"}, TLSEnabled: true})
+	assertValid(ServiceOptions{Hosts: []string{"example.com", "*.example.com"}, TLSEnabled: true})
+
+	assertNotValid(ServiceOptions{Hosts: []string{"example.com"}, PathPrefixes: []string{"/api"}, TLSEnabled: true}, "TLS settings must be specified on the root path service")
+	assertValid(ServiceOptions{Hosts: []string{"example.com"}, PathPrefixes: []string{"/"}, TLSEnabled: true})
+
+	assertNotValid(ServiceOptions{Hosts: []string{"example.com", "www.example.com"}, CanonicalHost: "api.example.com"}, "canonical-host 'api.example.com' must be present in the hosts list: [example.com www.example.com]")
+	assertValid(ServiceOptions{Hosts: []string{"example.com", "www.example.com"}, CanonicalHost: "www.example.com"})
+
+	assertValid(ServiceOptions{TLSEnabled: true, TLSOnDemandURL: "/allow-host"})
+	assertValid(ServiceOptions{TLSEnabled: true, TLSOnDemandURL: "https://example.com/allow-host"})
+	assertNotValid(ServiceOptions{Hosts: []string{"example.com"}, TLSEnabled: true, TLSOnDemandURL: "/allow-host"}, "cannot set hosts when using a TLS on-demand URL")
+	assertNotValid(ServiceOptions{TLSEnabled: true, TLSOnDemandURL: "ftp://example.com/allow-host"}, "unsupported scheme")
+	assertNotValid(ServiceOptions{TLSEnabled: true, TLSOnDemandURL: "://invalid-url"}, "unable to parse tls-on-demand-url")
+	assertNotValid(ServiceOptions{TLSEnabled: true, TLSOnDemandURL: "//example.com/allow-host"}, "must be a path or an absolute http(s) URL")
+	assertNotValid(ServiceOptions{PathPrefixes: []string{"/api"}, TLSEnabled: true, TLSOnDemandURL: "/allow-host"}, "TLS settings must be specified on the root path service")
+	assertNotValid(ServiceOptions{TLSOnDemandURL: "/allow-host"}, "TLS must be enabled to use a TLS on-demand URL")
+	assertNotValid(ServiceOptions{TLSEnabled: true, TLSOnDemandURL: "/allow-host", TLSCertificatePath: "cert.pem", TLSPrivateKeyPath: "key.pem"}, "cannot use a custom TLS certificate with a TLS on-demand URL")
+	assertNotValid(ServiceOptions{TLSEnabled: true, TLSOnDemandURL: "/allow-host", CanonicalHost: "example.com"}, "cannot set a canonical host when using a TLS on-demand URL")
+}
+
 func TestService_DontRedirectToHTTPSWhenTLSAndPlainHTTPAllowed(t *testing.T) {
 	var forwardedProto string
 
-	service := testCreateServiceWithHandler(t, ServiceOptions{Hosts: []string{"example.com"}, TLSEnabled: true, TLSRedirect: false}, defaultTargetOptions,
+	service := testCreateServiceWithHandler(
+		t, ServiceOptions{Hosts: []string{"example.com"}, TLSEnabled: true, TLSRedirect: false}, defaultTargetOptions,
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			forwardedProto = r.Header.Get("X-Forwarded-Proto")
 		}),
@@ -130,6 +222,45 @@ func TestService_ReturnSuccessfulHealthCheckWhilePausedOrStopped(t *testing.T) {
 	assert.Equal(t, http.StatusOK, checkRequest("/other"))
 }
 
+func TestServiceOptions_ShouldExcludeMetrics(t *testing.T) {
+	options := ServiceOptions{ExcludeMetricsPaths: []string{"/up", "/healthz"}}
+
+	assert.True(t, options.ShouldExcludeMetrics(httptest.NewRequest(http.MethodGet, "/up", nil)))
+	assert.True(t, options.ShouldExcludeMetrics(httptest.NewRequest(http.MethodPost, "/healthz", nil)))
+	assert.False(t, options.ShouldExcludeMetrics(httptest.NewRequest(http.MethodGet, "/api/users", nil)))
+	assert.False(t, options.ShouldExcludeMetrics(httptest.NewRequest(http.MethodGet, "/up/nested", nil)))
+
+	// When a path prefix is due to be stripped, match against the target's view of the path
+	assert.True(t, options.ShouldExcludeMetrics(testRequestWithMatchedPrefix(httptest.NewRequest(http.MethodGet, "/api/up", nil), "/api")))
+	assert.False(t, options.ShouldExcludeMetrics(testRequestWithMatchedPrefix(httptest.NewRequest(http.MethodGet, "/api/users", nil), "/api")))
+	assert.False(t, options.ShouldExcludeMetrics(httptest.NewRequest(http.MethodGet, "/api/up", nil)))
+
+	empty := ServiceOptions{}
+	assert.False(t, empty.ShouldExcludeMetrics(httptest.NewRequest(http.MethodGet, "/up", nil)))
+}
+
+func TestService_ExcludeMetricsPathsMarksRequestContext(t *testing.T) {
+	options := defaultServiceOptions
+	options.ExcludeMetricsPaths = []string{"/up", "/metrics"}
+
+	service := testCreateService(t, options, defaultTargetOptions)
+
+	checkExcluded := func(path string) bool {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		ctx := &loggingRequestContext{}
+		req = req.WithContext(context.WithValue(req.Context(), contextKeyRequestContext, ctx))
+
+		w := httptest.NewRecorder()
+		service.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Result().StatusCode)
+		return ctx.ExcludeMetrics
+	}
+
+	assert.True(t, checkExcluded("/up"))
+	assert.True(t, checkExcluded("/metrics"))
+	assert.False(t, checkExcluded("/other"))
+}
+
 func TestService_MarshallingState(t *testing.T) {
 	targetOptions := TargetOptions{
 		HealthCheckConfig:   HealthCheckConfig{Path: "/health", Interval: time.Second, Timeout: 2 * time.Second},
@@ -143,6 +274,7 @@ func TestService_MarshallingState(t *testing.T) {
 	service.UpdateLoadBalancer(NewLoadBalancer(service.active.Targets(), DefaultWriterAffinityTimeout, false), TargetSlotRollout)
 
 	require.NoError(t, service.SetRolloutSplit(20, []string{"first"}))
+	require.NoError(t, service.EnableRollout())
 
 	var buf bytes.Buffer
 	err := json.NewEncoder(&buf).Encode(service)
@@ -162,6 +294,52 @@ func TestService_MarshallingState(t *testing.T) {
 
 	assert.Equal(t, 20, service2.rolloutController.Percentage)
 	assert.Equal(t, []string{"first"}, service2.rolloutController.Allowlist)
+	assert.True(t, service2.rolloutController.Enabled)
+}
+
+func TestService_MarshallingStateAfterRemovingRollout(t *testing.T) {
+	service := testCreateService(t, defaultServiceOptions, defaultTargetOptions)
+	t.Cleanup(service.Dispose)
+	service.UpdateLoadBalancer(NewLoadBalancer(service.active.Targets(), DefaultWriterAffinityTimeout, false), TargetSlotRollout)
+	require.NoError(t, service.SetRolloutSplit(20, []string{"first"}))
+
+	removed, err := service.RemoveRollout()
+	require.NoError(t, err)
+	removed.Dispose()
+
+	var buf bytes.Buffer
+	require.NoError(t, json.NewEncoder(&buf).Encode(service))
+
+	var service2 Service
+	require.NoError(t, json.NewDecoder(&buf).Decode(&service2))
+	t.Cleanup(service2.Dispose)
+
+	assert.Nil(t, service2.rollout)
+	assert.Nil(t, service2.rolloutController)
+}
+
+func TestService_RemovingRolloutWhileDrainingAndMarshalling(t *testing.T) {
+	service := testCreateService(t, defaultServiceOptions, defaultTargetOptions)
+	t.Cleanup(service.Dispose)
+
+	for range 50 {
+		targets, err := NewTargetList(nil, nil, defaultTargetOptions)
+		require.NoError(t, err)
+		service.UpdateLoadBalancer(NewLoadBalancer(targets, DefaultWriterAffinityTimeout, false), TargetSlotRollout)
+
+		PerformConcurrently(
+			func() { service.Drain(time.Second) },
+			func() { service.Dispose() },
+			func() { _, _ = json.Marshal(service) },
+			func() {
+				removed, err := service.RemoveRollout()
+				require.NoError(t, err)
+				removed.Dispose()
+			},
+		)
+	}
+
+	assert.Nil(t, service.rollout)
 }
 
 func TestService_UnmarshallingStateFromLegacyFormat(t *testing.T) {
@@ -217,7 +395,8 @@ func TestService_UnmarshallingStateFromLegacyFormat(t *testing.T) {
 }
 
 func testCreateService(t *testing.T, options ServiceOptions, targetOptions TargetOptions) *Service {
-	return testCreateServiceWithHandler(t, options, targetOptions,
+	return testCreateServiceWithHandler(
+		t, options, targetOptions,
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}),
 	)
 }
